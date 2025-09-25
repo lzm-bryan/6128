@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os, re, json, time
+import os, re, io, json, time, shutil, zipfile
 import numpy as np
 import pandas as pd
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from urllib.request import urlopen, Request
 import folium
 from folium.features import GeoJsonTooltip
@@ -31,13 +31,13 @@ DRAW_POINT_SAMPLE_EVERY = 0       # >0 抽样画点；0=不画点（仅折线）
 STYLE_FIELD             = ""      # GeoJSON properties 分类字段（填了就按字段自动配色）
 VERBOSE                 = True    # 打印每个文件的统计
 
-# —— 地磁热力图参数 ——（对齐单层脚本的思路）
+# —— 地磁热力图参数 ——（与单层脚本对齐）
 ENABLE_HEATMAP          = True
-PREFER_UNCALIBRATED     = False   # 和单层版一致：默认优先 CALIBRATED；需要时可改 True
+PREFER_UNCALIBRATED     = False   # True=优先 UNCAL；默认优先 CALIBRATED
 ACC_FILTER              = 0       # 仅保留磁场样本 accuracy>=此阈值（0/1/2/3；0=不过滤）
-MAX_MAG_POINTS          = 20000   # 每层热力点总量上限（超过会等步长抽样）
+MAX_MAG_POINTS          = 20000   # 每层热力点总量上限（超过将随机抽样）
 ROBUST_CLIP_P           = (5, 95) # 权重归一化的分位裁剪（抗异常值）
-NEAREST_TOL_MS          = 0       # 宽松回退：若不在两路标之间，允许用“最近路标”且|Δt|<=该阈值（毫秒）；0=关闭
+NEAREST_TOL_MS          = 0       # 严格插值失败时，最近路标兜底阈值（毫秒）；0=关闭
 HEAT_RADIUS             = 6
 HEAT_BLUR               = 15
 HEAT_MIN_OPACITY        = 0.4
@@ -50,9 +50,28 @@ def _to_raw(url: str) -> str:
     return url.replace("https://github.com/","https://raw.githubusercontent.com/").replace("/blob/","/") if _is_github_blob(url) else url
 
 def _req(url: str) -> bytes:
-    req = Request(url, headers={"User-Agent":"Mozilla/5.0","Accept":"*/*"})
+    headers = {
+        "User-Agent":"Mozilla/5.0",
+        "Accept":"application/vnd.github+json" if "api.github.com" in url else "*/*"
+    }
+    # 支持 GitHub Token，显著降低 API 限速（GITHUB_TOKEN 或 GH_TOKEN）
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if "api.github.com" in url and token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, headers=headers)
     with urlopen(req, timeout=60) as r:
         return r.read()
+
+def _file_url_to_path(url: str) -> str:
+    """file:///C:/a/b.txt -> C:\\a\\b.txt（兼容 Windows）"""
+    p = urlparse(url)
+    path = unquote(p.path)
+    if os.name == "nt":
+        # windows: /C:/path → C:\path
+        if path.startswith("/") and len(path) >= 4 and path[2] == ":":
+            path = path[1:]
+        path = path.replace("/", "\\")
+    return path
 
 def _download_to_cache(url: str, cache_dir: str, filename: str = None, force: bool = False) -> str:
     os.makedirs(cache_dir, exist_ok=True)
@@ -63,45 +82,152 @@ def _download_to_cache(url: str, cache_dir: str, filename: str = None, force: bo
     if (not force) and os.path.exists(path) and os.path.getsize(path) > 0:
         if VERBOSE: print(f"↩️  缓存命中：{path}")
         return path
+
+    # 支持 file:// 直接复制（仓库 ZIP 快照兜底）
+    if raw_url.startswith("file://"):
+        src = _file_url_to_path(raw_url)
+        shutil.copyfile(src, path)
+        if VERBOSE: print(f"📄  复制本地：{src} → {path}")
+        return path
+
     print(f"⬇️  下载：{raw_url}")
     data = _req(raw_url)
     with open(path, "wb") as f: f.write(data)
     print(f"✅ 完成：{path}（{len(data)/1024:.1f} KB）")
     return path
 
-def _list_txt_in_github_dir(tree_url: str):
-    """优先 GitHub API；失败用 HTML 兜底解析 `.txt`。"""
+def _parse_repo_and_path(tree_url: str):
     p = urlparse(tree_url)
     parts = [x for x in p.path.strip("/").split("/") if x]
     assert len(parts) >= 2, "非法 GitHub 链接"
     owner, repo = parts[0], parts[1]
+    branch = "master"
     if len(parts) >= 4 and parts[2] == "tree":
         branch = parts[3]
         subpath = "/".join(parts[4:])
     else:
-        branch = "master"
         subpath = "/".join(parts[2:])
+    return owner, repo, branch, subpath
+
+# ---- 仓库 ZIP 快照兜底（不受 API 限速影响） ----
+def _get_repo_snapshot_root(owner: str, repo: str, branch: str) -> str:
+    """下载并解压仓库 ZIP 到缓存目录，返回解压后的根目录（通常是 repo-branch）"""
+    base = os.path.join(CACHE_ROOT, "_repo_snapshots", f"{owner}_{repo}_{branch}")
+    os.makedirs(base, exist_ok=True)
+    marker = os.path.join(base, ".extracted")
+    if not os.path.exists(marker):
+        url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+        print(f"📦  下载仓库快照：{url}")
+        data = _req(url)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            zf.extractall(base)
+        # 写标记文件
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        print(f"✅ 快照解压完成：{base}")
+    # 选择解压后的根目录（通常只有一个子目录）
+    candidates = [os.path.join(base, d) for d in os.listdir(base) if os.path.isdir(os.path.join(base, d)) and not d.startswith(".")]
+    if not candidates:
+        raise RuntimeError("仓库快照解压失败：未找到根目录")
+    # 优先 repo-branch 命名
+    pref = f"{repo}-{branch}"
+    for c in candidates:
+        if os.path.basename(c) == pref:
+            return c
+    return candidates[0]
+
+def _list_txt_in_snapshot(owner: str, repo: str, branch: str, subpath: str):
+    """从本地仓库快照中列举 subpath 下的 .txt 文件"""
+    root = _get_repo_snapshot_root(owner, repo, branch)
+    target_dir = os.path.join(root, subpath.replace("/", os.sep))
+    if not os.path.isdir(target_dir):
+        return []
+    out = []
+    for name in sorted(os.listdir(target_dir)):
+        if name.lower().endswith(".txt"):
+            local_path = os.path.join(target_dir, name)
+            out.append({"name": name, "download_url": f"file:///{local_path}" if os.name == "nt" else f"file://{local_path}"})
+    return out
+
+def _list_txt_in_github_dir(tree_url: str):
+    """
+    目录列举顺序：
+      1) Contents API: /repos/{owner}/{repo}/contents/{subpath}?ref={branch}
+      2) Git Tree API (recursive): /repos/{owner}/{repo}/git/trees/{branch}?recursive=1
+      3) HTML 兜底：解析 /blob/... .txt 的链接
+      4) ZIP 快照兜底：下载仓库快照并从本地列举
+    任一步拿到结果即返回。
+    """
+    owner, repo, branch, subpath = _parse_repo_and_path(tree_url)
+
+    # 1) Contents API
     api = f"https://api.github.com/repos/{owner}/{repo}/contents/{subpath}?ref={branch}"
     try:
         data = json.loads(_req(api).decode("utf-8", "ignore"))
         files = []
         for it in data:
-            if it.get("type") == "file" and it.get("name","").endswith(".txt"):
-                files.append({"name": it["name"], "download_url": it.get("download_url")})
+            if it.get("type") == "file" and it.get("name","").lower().endswith(".txt"):
+                dl = it.get("download_url") or f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{it['path']}"
+                files.append({"name": it["name"], "download_url": dl})
+        if files:
+            return files
+        else:
+            print("ℹ️ Contents API 返回空目录。")
+    except Exception as e:
+        print(f"⚠️ API 失败：{e}；尝试 Git Tree API。")
+
+    # 2) Git Tree API（全树递归，再按前缀过滤）
+    tree_api = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    try:
+        data = json.loads(_req(tree_api).decode("utf-8", "ignore"))
+        tree = data.get("tree", []) or []
+        prefix = subpath.rstrip("/") + "/"
+        files = []
+        for it in tree:
+            if it.get("type") == "blob":
+                path = it.get("path","")
+                if path.startswith(prefix) and path.lower().endswith(".txt"):
+                    files.append({
+                        "name": os.path.basename(path),
+                        "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+                    })
+        if files:
+            return files
+        else:
+            print("ℹ️ Git Tree API 未找到 .txt。")
+    except Exception as e:
+        print(f"⚠️ Git Tree API 失败：{e}；改用 HTML 解析。")
+
+    # 3) HTML 兜底：抓取 /blob/... .txt（兼容 ?plain=1）
+    try:
+        html = _req(tree_url).decode("utf-8","ignore")
+        # 捕获 /owner/repo/blob/branch/.../*.txt 或完整 https 链接（含 ?plain=1 等）
+        hrefs = re.findall(r'href="((?:https://github\.com)?/[^"]+/blob/[^"]+?\.txt(?:\?[^"]*)?)"', html)
+        files = []
+        seen = set()
+        for h in hrefs:
+            if not h.startswith("http"):
+                h = f"https://github.com{h}"
+            name = os.path.basename(urlparse(h).path)
+            if name.lower().endswith(".txt") and (name, h) not in seen:
+                files.append({"name": name, "download_url": _to_raw(h)})
+                seen.add((name, h))
+        if files:
+            return files
+        else:
+            print("ℹ️ HTML 兜底未匹配到 .txt，转用 ZIP 快照。")
+    except Exception as e:
+        print(f"⚠️ HTML 解析失败：{e}；转用 ZIP 快照。")
+
+    # 4) ZIP 快照兜底
+    try:
+        files = _list_txt_in_snapshot(owner, repo, branch, subpath)
+        if files:
+            print(f"📦  来自本地仓库快照：找到 {len(files)} 个 .txt")
         return files
     except Exception as e:
-        print(f"⚠️ API 失败：{e}；改用 HTML 解析。")
-    # HTML 兜底
-    html = _req(tree_url).decode("utf-8","ignore")
-    hrefs = re.findall(r'href="([^"]+\.txt)"', html)
-    files = []
-    for h in hrefs:
-        if not h.startswith("http"):
-            h = f"https://github.com{h}"
-        if "/blob/" not in h:
-            continue
-        files.append({"name": os.path.basename(urlparse(h).path), "download_url": _to_raw(h)})
-    return files
+        print(f"❌ ZIP 快照兜底失败：{e}")
+        return []
 
 def _read_json(path: str):
     with open(path,"r",encoding="utf-8") as f:
@@ -169,7 +295,6 @@ def _read_magnetometer(path: str) -> pd.DataFrame:
     df_cal   = pd.DataFrame(rec_cal,   columns=["ts","mx","my","mz","acc"]).sort_values("ts").reset_index(drop=True)
     df_uncal = pd.DataFrame(rec_uncal, columns=["ts","mx","my","mz","acc"]).sort_values("ts").reset_index(drop=True)
 
-    df = None
     if PREFER_UNCALIBRATED and not df_uncal.empty:
         df = df_uncal
     elif (not PREFER_UNCALIBRATED) and not df_cal.empty:
@@ -186,7 +311,7 @@ def _read_magnetometer(path: str) -> pd.DataFrame:
     return df
 
 # ================= 坐标变换 & GeoJSON =================
-def _xy_to_leaflet(x,y,h):  # meters -> CRS.Simple (lon=x, lat=h-y)
+def _xy_to_leaflet(x, y, h):  # meters -> CRS.Simple (lon=x, lat=h-y)
     return [x, h - y]
 
 def _transform_geojson(gj: dict, map_h: float):
@@ -206,64 +331,52 @@ def _transform_geojson(gj: dict, map_h: float):
         return out
     return {"type": gj.get("type","GeometryCollection"), "coordinates": _tx(gj.get("coordinates",[]))}
 
-# ================= 从单个 txt 生成“未归一化”的热力样本（lat,lon,B） =================
-def _heat_points_for_file(txt_path: str, map_h: float, verbose: bool = False) -> list:
-    wp = _read_waypoints(txt_path)
-    mg = _read_magnetometer(txt_path)
-
-    if verbose:
-        print(f"      · {os.path.basename(txt_path)}  waypoints={len(wp)}  magnetometer={len(mg)}")
-
-    if wp.empty or mg.empty:
+# ================= Tooltip 字段推断（过滤 style 等非法字段） =================
+def _infer_tooltip_fields(gj: dict, max_fields: int = 6) -> list:
+    feats = gj.get("features") or []
+    if not feats:
         return []
+    blacklist = {"style","styles","stroke","fill","stroke-width","stroke-opacity","fill-opacity"}
+    def scalar_keys(props: dict):
+        out = set()
+        for k, v in (props or {}).items():
+            if k in blacklist:
+                continue
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                out.add(k)
+        return out
+    common = None
+    for ft in feats:
+        keys = scalar_keys(ft.get("properties") or {})
+        common = keys if common is None else (common & keys)
+    if not common:
+        return []
+    return sorted(common)[:max_fields]
 
-    wp2  = wp[["ts","x","y"]].drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    mg   = mg.sort_values("ts").reset_index(drop=True)
-    wp2n = wp2.rename(columns={"ts":"ts2","x":"x2","y":"y2"})
+# —— 磁场样本时间插值到 (x,y) ——（单层脚本原实现）
+def interpolate_magnetic_to_xy(mf: pd.DataFrame, wp: pd.DataFrame) -> pd.DataFrame:
+    if mf.empty or len(wp) < 2:
+        return pd.DataFrame(columns=["ts","x","y","B"])
+    wp = wp.sort_values("ts")
+    mf = mf.sort_values("ts")
 
-    # asof 前后路标
-    prev = pd.merge_asof(mg, wp2, on="ts", direction="backward", allow_exact_matches=True)
-    nxt  = pd.merge_asof(mg.assign(ts2=mg["ts"]), wp2n, on="ts2", direction="forward", allow_exact_matches=True)
+    prev = pd.merge_asof(
+        mf[["ts","B"]],
+        wp[["ts","x","y"]].rename(columns={"ts":"ts_prev","x":"x_prev","y":"y_prev"}),
+        left_on="ts", right_on="ts_prev", direction="backward"
+    )
+    nxt = pd.merge_asof(
+        mf[["ts"]],
+        wp[["ts","x","y"]].rename(columns={"ts":"ts_next","x":"x_next","y":"y_next"}),
+        left_on="ts", right_on="ts_next", direction="forward"
+    )
+    z = prev.join(nxt[["ts_next","x_next","y_next"]])
+    z = z[(~z["ts_prev"].isna()) & (~z["ts_next"].isna()) & (z["ts_next"] > z["ts_prev"])]
 
-    df = mg.copy()
-    df["x0"] = prev["x"];  df["y0"] = prev["y"];  df["t0"] = prev["ts"]
-    df["x1"] = nxt["x2"];  df["y1"] = nxt["y2"];  df["t1"] = nxt["ts2"]
-
-    before = len(df)
-    df = df.dropna(subset=["x0","y0","x1","y1","t0","t1"])
-    df = df[df["t1"] > df["t0"]]
-
-    if verbose:
-        print(f"        ↳ 可插值样本 {len(df)}/{before}")
-
-    latlonB = []
-
-    # ① 严格插值：落在两路标之间
-    if len(df) > 0:
-        alpha = (df["ts"] - df["t0"]) / (df["t1"] - df["t0"])
-        x = df["x0"] + alpha * (df["x1"] - df["x0"])
-        y = df["y0"] + alpha * (df["y1"] - df["y0"])
-        B = np.sqrt(df["mx"]**2 + df["my"]**2 + df["mz"]**2).astype(float)
-        for xi, yi, bi in zip(x, y, B):
-            lon, lat = _xy_to_leaflet(float(xi), float(yi), map_h)
-            latlonB.append([lat, lon, float(bi)])
-
-    # ② 可选宽松回退：最近路标（|Δt|<=NEAREST_TOL_MS）
-    if len(latlonB) == 0 and NEAREST_TOL_MS and NEAREST_TOL_MS > 0:
-        near = pd.merge_asof(
-            mg[["ts","mx","my","mz"]].sort_values("ts"),
-            wp2.sort_values("ts"),
-            on="ts", direction="nearest", tolerance=NEAREST_TOL_MS
-        ).dropna(subset=["x","y"])
-        if not near.empty:
-            B = np.sqrt(near["mx"]**2 + near["my"]**2 + near["mz"]**2).astype(float)
-            for xi, yi, bi in zip(near["x"], near["y"], B):
-                lon, lat = _xy_to_leaflet(float(xi), float(yi), map_h)
-                latlonB.append([lat, lon, float(bi)])
-            if verbose:
-                print(f"        ↳ 回退(最近路标±{NEAREST_TOL_MS}ms)：{len(latlonB)} 点")
-
-    return latlonB
+    t = (z["ts"] - z["ts_prev"]) / (z["ts_next"] - z["ts_prev"])
+    z["x"] = z["x_prev"] + t * (z["x_next"] - z["x_prev"])
+    z["y"] = z["y_prev"] + t * (z["y_next"] - z["y_prev"])
+    return z[["ts","x","y","B"]].reset_index(drop=True)
 
 # ================= 主流程 =================
 def main():
@@ -274,8 +387,9 @@ def main():
                "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"]
 
     # 记录每层的 JS 变量名与边界，供控件使用
-    floor_entries = []  # dict: {key, base_var, gt_var, heat_var, bounds_js}
+    floor_entries = []
     default_floor_key = None
+    default_bounds = None
 
     for site, floors in FLOOR_SETS.items():
         for floor_name in floors:
@@ -296,23 +410,21 @@ def main():
             map_w = float(floorinfo["map_info"]["width"])
             map_h = float(floorinfo["map_info"]["height"])
             bounds = [[0,0],[map_h,map_w]]
+            if default_bounds is None:
+                default_bounds = bounds
 
             # GeoJSON -> Simple CRS
             gj   = _read_json(geojson_path)
             gj_s = _transform_geojson(gj, map_h)
 
             # —— 楼层“BASE”组：底图 + GeoJSON ——（作为一个整体被显示/隐藏）
-            base_group = folium.FeatureGroup(name=f"{key} | BASE}", show=False)
+            base_group = folium.FeatureGroup(name=f"{key} | BASE", show=False)
+
             folium.raster_layers.ImageOverlay(
                 image=img_path, bounds=bounds, opacity=1.0, interactive=False, name=f"{key} floor"
             ).add_to(base_group)
 
-            tooltip_fields = []
-            for ft in gj.get("features", []):
-                for k in (ft.get("properties") or {}).keys():
-                    if k not in tooltip_fields: tooltip_fields.append(k)
-                    if len(tooltip_fields) >= 6: break
-                if len(tooltip_fields) >= 6: break
+            tooltip_fields = _infer_tooltip_fields(gj, max_fields=6)
 
             def style_fn(feat):
                 props = feat.get("properties") or {}
@@ -334,7 +446,7 @@ def main():
             # —— 楼层“GT”组：该层所有文件汇总的一组轨迹折线 ——（便于总控/本层控）
             gt_group = folium.FeatureGroup(name=f"{key} | GT", show=False)
 
-            # 列出并下载该层所有 txt
+            # 列出并下载该层所有 txt（多级兜底，最终可走 ZIP 快照）
             txt_dir_url = f"https://github.com/location-competition/indoor-location-competition-20/tree/master/data/{site}/{floor_name}/path_data_files"
             files = _list_txt_in_github_dir(txt_dir_url)
             files = [f for f in files if NAME_FILTER in f["name"]]
@@ -343,60 +455,98 @@ def main():
                 files = files[:MAX_FILES_PER_FLOOR]
             print(f"🗂  {key} 发现 txt：{len(files)} 个")
 
-            # 汇总绘制 GT & 收集热力点（先收集 |B|，稍后统一做鲁棒归一化）
+            # 汇总绘制 GT；并收集热力点的原始 (x,y,B)（合并后统一归一化）
             color_i = 0
             total_pts = 0
-            heat_points_latlonB = []
+            xyB_all = []
+            n_wp_used = n_mf_used = 0
 
             for it in files:
-                local_txt = _download_to_cache(it["download_url"], cache_dir, filename=it["name"])
-                df = _read_waypoints(local_txt)
-                if df.empty:
-                    if VERBOSE: print(f"      · {it['name']} 无 WAYPOINT")
+                try:
+                    local_txt = _download_to_cache(it["download_url"], cache_dir, filename=it["name"])
+                except Exception as e:
+                    if VERBOSE: print(f"      · 下载失败 {it['name']}: {e}")
                     continue
-                # 折线
-                coords = [[_xy_to_leaflet(x,y,map_h)[1], _xy_to_leaflet(x,y,map_h)[0]] for x,y in zip(df["x"], df["y"])]
-                if len(coords) >= 2:
-                    folium.PolyLine(coords, weight=3, opacity=0.9, color=palette[color_i % len(palette)],
-                                    tooltip=it["name"]).add_to(gt_group)
-                # 可选：抽样画点
-                if DRAW_POINT_SAMPLE_EVERY and DRAW_POINT_SAMPLE_EVERY > 0:
-                    for lat, lon in coords[::DRAW_POINT_SAMPLE_EVERY]:
-                        folium.CircleMarker([lat,lon], radius=2, weight=1, fill=True, fill_opacity=0.9,
-                                            color="#333333").add_to(gt_group)
-                color_i += 1
-                total_pts += len(coords)
 
-                # 热力点（来自地磁 + waypoint 时间插值）
-                if ENABLE_HEATMAP:
-                    hp = _heat_points_for_file(local_txt, map_h, verbose=VERBOSE)
-                    heat_points_latlonB.extend(hp)
+                wp = _read_waypoints(local_txt)
+                mg = _read_magnetometer(local_txt)
+
+                # 画 GT 折线
+                if not wp.empty:
+                    coords = [[ _xy_to_leaflet(x,y,map_h)[1], _xy_to_leaflet(x,y,map_h)[0] ] for x,y in zip(wp["x"], wp["y"])]
+                    if len(coords) >= 2:
+                        folium.PolyLine(coords, weight=3, opacity=0.9, color=palette[color_i % len(palette)],
+                                        tooltip=it["name"]).add_to(gt_group)
+                    if DRAW_POINT_SAMPLE_EVERY and DRAW_POINT_SAMPLE_EVERY > 0:
+                        for lat, lon in coords[::DRAW_POINT_SAMPLE_EVERY]:
+                            folium.CircleMarker([lat,lon], radius=2, weight=1, fill=True, fill_opacity=0.9,
+                                                color="#333333").add_to(gt_group)
+                    color_i += 1
+                    total_pts += len(coords)
+
+                # 收集 (x,y,B)
+                if wp.empty or mg.empty:
+                    if VERBOSE: print(f"      · {it['name']} 无法插值（waypoints={len(wp)}, mag={len(mg)})")
+                    continue
+
+                mf = mg.copy()
+                mf["B"] = np.sqrt(mf["mx"]**2 + mf["my"]**2 + mf["mz"]**2)
+                xyB = interpolate_magnetic_to_xy(mf[["ts","B"]], wp[["ts","x","y"]])
+
+                # 兜底：最近路标（仅当严格插值没有一个点时）
+                if xyB.empty and NEAREST_TOL_MS and NEAREST_TOL_MS > 0:
+                    near = pd.merge_asof(
+                        mf[["ts","B"]].sort_values("ts"),
+                        wp.sort_values("ts"),
+                        on="ts", direction="nearest", tolerance=NEAREST_TOL_MS
+                    ).dropna(subset=["x","y","B"])
+                    if not near.empty:
+                        xyB = near[["ts","x","y","B"]].reset_index(drop=True)
+                        if VERBOSE:
+                            print(f"        ↳ 回退(最近路标±{NEAREST_TOL_MS}ms)：{len(xyB)} 点")
+
+                if not xyB.empty:
+                    xyB_all.append(xyB)
+                    n_wp_used += len(wp); n_mf_used += len(mg)
+                elif VERBOSE:
+                    print(f"      · {it['name']} 没有得到可用的 (x,y,B) 点")
 
             gt_group.add_to(m)
 
-            # —— 楼层“HEAT”组 ——（统一对 |B| 做鲁棒归一化 → 权重 0~1）
+            # —— 楼层“HEAT”组 ——（合并后统一做鲁棒归一化 → 权重 0~1）
             heat_group = folium.FeatureGroup(name=f"{key} | Heat", show=False)
-            if ENABLE_HEATMAP and len(heat_points_latlonB) > 0:
-                # 限量（再次兜底）
-                hp = heat_points_latlonB
-                if len(hp) > MAX_MAG_POINTS:
-                    step = int(np.ceil(len(hp) / MAX_MAG_POINTS))
-                    hp = hp[::step]
+            if ENABLE_HEATMAP and len(xyB_all) > 0:
+                xyB = pd.concat(xyB_all, ignore_index=True)
 
-                # 鲁棒归一化（分位裁剪）
-                Bvals = np.array([w for _,_,w in hp], dtype=float)
+                # 权重：鲁棒分位
+                Bvals = xyB["B"].to_numpy(dtype=float)
                 plo, phi = np.percentile(Bvals, ROBUST_CLIP_P)
-                denom = max(1e-6, (phi - plo))
-                weights = np.clip((Bvals - plo) / denom, 0.0, 1.0)
-                heat_points = [[lat, lon, float(w)] for (lat,lon,_), w in zip(hp, weights)]
+                if not np.isfinite(plo) or not np.isfinite(phi) or (phi - plo) <= 1e-9:
+                    weights = np.ones_like(Bvals, dtype=float)  # 防退化：全部置 1
+                else:
+                    weights = np.clip((Bvals - plo) / (phi - plo), 0.0, 1.0)
+                xyB = xyB.assign(w=weights)
+
+                # 限量（随机抽样更稳，避免时间步进偏置）
+                if len(xyB) > MAX_MAG_POINTS:
+                    xyB = xyB.sample(MAX_MAG_POINTS, random_state=42)
+
+                # 转成 HeatMap 需要的 [lat, lon, weight]
+                heat_points = []
+                for _, r in xyB.iterrows():
+                    lon, lat = _xy_to_leaflet(float(r["x"]), float(r["y"]), map_h)
+                    heat_points.append([lat, lon, float(r["w"])])
 
                 HeatMap(
                     heat_points, radius=HEAT_RADIUS, blur=HEAT_BLUR,
                     min_opacity=HEAT_MIN_OPACITY, max_zoom=18
                 ).add_to(heat_group)
-            heat_group.add_to(m)
 
-            print(f"   ↳ GT 折线点数：{total_pts}，热力点：{len(heat_points_latlonB)}")
+                print(f"   ↳ {key} 参与插值的文件：{len(files)}，样本点：{len(xyB)}，wp≈{n_wp_used}，mag≈{n_mf_used}")
+            else:
+                print(f"⚠️  {key} 无可用热力点")
+
+            heat_group.add_to(m)
 
             # 收集 JS 引用
             floor_entries.append({
@@ -407,26 +557,35 @@ def main():
                 "bounds_js": f"[[0,0],[{map_h},{map_w}]]",
             })
 
+    # 初始视野更稳：Python 端先适配第一层边界
+    if default_bounds is not None:
+        try:
+            m.fit_bounds(default_bounds)
+        except Exception:
+            pass
+
     folium.LayerControl(collapsed=False).add_to(m)
 
     # ================= 自定义控件（楼层切换 + GT/Heat 本层开关 + 全楼总控） =================
     js_lines = ["var floorGroups = {};"]
     for ent in floor_entries:
         js_lines.append(
-            f'floorGroups["{ent["key"]}"] = {{base:{ent["base_var"]}, gt:{ent["gt_var"]}, heat:{ent["heat_var"]}, bounds:{ent["bounds_js"]}}};'
+            'floorGroups["{k}"] = {{base:{b}, gt:{g}, heat:{h}, bounds:{bd}}};'.format(
+                k=ent["key"], b=ent["base_var"], g=ent["gt_var"], h=ent["heat_var"], bd=ent["bounds_js"]
+            )
         )
     js_floor_groups = "\n".join(js_lines)
     first_key = (floor_entries[0]["key"] if floor_entries else "")
 
     floor_options_html = "".join([f'<option value="{ent["key"]}">{ent["key"]}</option>' for ent in floor_entries])
 
-    ctrl_html = f"""
-    {js_floor_groups}
-    (function() {{
-        var map = {m.get_name()};
+    ctrl_tpl = r"""
+    %%GROUPS%%
+    (function() {
+        var map = %%MAP%%;
         // 控件 UI
-        var ctrl = L.control({{position:'topright'}});
-        ctrl.onAdd = function() {{
+        var ctrl = L.control({position:'topright'});
+        ctrl.onAdd = function() {
             var div = L.DomUtil.create('div', 'leaflet-bar');
             div.style.background = 'white';
             div.style.padding = '8px';
@@ -437,7 +596,7 @@ def main():
                 <div style="margin-bottom:6px;">
                   <label>楼层：</label>
                   <select id="floorSel" style="max-width:200px;">
-                    {floor_options_html}
+                    %%OPTIONS%%
                   </select>
                 </div>
                 <div style="margin-bottom:6px;">
@@ -456,91 +615,94 @@ def main():
             `;
             L.DomEvent.disableClickPropagation(div);
             return div;
-        }};
+        };
         ctrl.addTo(map);
 
         var allGTOn = false;
         var allHeatOn = false;
-        var currentFloor = "{first_key}";
+        var currentFloor = "%%FIRST%%";
 
-        function hideAllBases() {{
-            for (var k in floorGroups) {{
+        function hideAllBases() {
+            for (var k in floorGroups) {
                 if (map.hasLayer(floorGroups[k].base)) map.removeLayer(floorGroups[k].base);
-            }}
-        }}
+            }
+        }
 
-        function updatePerFloorCheckboxes() {{
+        function updatePerFloorCheckboxes() {
             var g = floorGroups[currentFloor];
             var chkGT = document.getElementById('chkFloorGT');
             var chkHeat = document.getElementById('chkFloorHeat');
             if (chkGT) chkGT.checked = map.hasLayer(g.gt);
             if (chkHeat) chkHeat.checked = map.hasLayer(g.heat);
-        }}
+        }
 
-        function showFloor(key) {{
+        function showFloor(key) {
             currentFloor = key;
             hideAllBases();
             var g = floorGroups[key];
             map.addLayer(g.base);
 
-            // 按本层开关决定是否显示
             var chkGT = document.getElementById('chkFloorGT');
             var chkHeat = document.getElementById('chkFloorHeat');
             if (chkGT && chkGT.checked) map.addLayer(g.gt); else if (map.hasLayer(g.gt)) map.removeLayer(g.gt);
             if (chkHeat && chkHeat.checked) map.addLayer(g.heat); else if (map.hasLayer(g.heat)) map.removeLayer(g.heat);
 
-            try {{ map.fitBounds(g.bounds); }} catch(e) {{}}
-        }}
+            try { map.fitBounds(g.bounds); } catch(e) {}
+        }
 
-        function setAllGT(on) {{
+        function setAllGT(on) {
             allGTOn = on;
-            for (var k in floorGroups) {{
+            for (var k in floorGroups) {
                 if (on) map.addLayer(floorGroups[k].gt);
                 else if (map.hasLayer(floorGroups[k].gt)) map.removeLayer(floorGroups[k].gt);
-            }}
+            }
             var lbl = document.getElementById('lblAllGT');
             if (lbl) lbl.textContent = '（全楼：' + (on ? '显示' : '隐藏') + '）';
             updatePerFloorCheckboxes();
-        }}
+        }
 
-        function setAllHeat(on) {{
+        function setAllHeat(on) {
             allHeatOn = on;
-            for (var k in floorGroups) {{
+            for (var k in floorGroups) {
                 if (on) map.addLayer(floorGroups[k].heat);
                 else if (map.hasLayer(floorGroups[k].heat)) map.removeLayer(floorGroups[k].heat);
-            }}
+            }
             var lbl = document.getElementById('lblAllHeat');
             if (lbl) lbl.textContent = '（全楼：' + (on ? '显示' : '隐藏') + '）';
             updatePerFloorCheckboxes();
-        }}
+        }
 
-        // 事件
-        document.getElementById('floorSel').addEventListener('change', function() {{
+        document.getElementById('floorSel').addEventListener('change', function() {
             showFloor(this.value);
-        }});
-        document.getElementById('chkFloorGT').addEventListener('change', function() {{
+        });
+        document.getElementById('chkFloorGT').addEventListener('change', function() {
             var g = floorGroups[currentFloor];
             if (this.checked) map.addLayer(g.gt); else if (map.hasLayer(g.gt)) map.removeLayer(g.gt);
-        }});
-        document.getElementById('chkFloorHeat').addEventListener('change', function() {{
+        });
+        document.getElementById('chkFloorHeat').addEventListener('change', function() {
             var g = floorGroups[currentFloor];
             if (this.checked) map.addLayer(g.heat); else if (map.hasLayer(g.heat)) map.removeLayer(g.heat);
-        }});
-        document.getElementById('btnToggleAllGT').addEventListener('click', function() {{
+        });
+        document.getElementById('btnToggleAllGT').addEventListener('click', function() {
             setAllGT(!allGTOn);
-        }});
-        document.getElementById('btnToggleAllHeat').addEventListener('click', function() {{
+        });
+        document.getElementById('btnToggleAllHeat').addEventListener('click', function() {
             setAllHeat(!allHeatOn);
-        }});
+        });
 
-        // 初始化：显示第一层，默认本层 GT/Heat 为“勾选→显示”，全楼总控保持“隐藏”
-        setTimeout(function() {{
+        setTimeout(function() {
             var sel = document.getElementById('floorSel');
-            if (sel) sel.value = "{first_key}";
-            showFloor("{first_key}");
-        }}, 50);
-    }})();
+            if (sel) sel.value = "%%FIRST%%";
+            if ("%%FIRST%%") showFloor("%%FIRST%%");
+        }, 50);
+    })();
     """
+
+    ctrl_html = (ctrl_tpl
+                 .replace("%%GROUPS%%", js_floor_groups)
+                 .replace("%%MAP%%", m.get_name())
+                 .replace("%%FIRST%%", first_key)
+                 .replace("%%OPTIONS%%", floor_options_html))
 
     folium.Element(f"<script>{ctrl_html}</script>").add_to(m)
 

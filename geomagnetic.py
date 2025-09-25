@@ -11,13 +11,13 @@ from folium.features import GeoJsonTooltip
 from folium.plugins import HeatMap, MarkerCluster
 
 # ========== 配置（按需修改） ==========
-GEOJSON_URL    = "https://github.com/location-competition/indoor-location-competition-20/blob/master/data/site1/B1/geojson_map.json"
-FLOOR_INFO_URL = "https://github.com/location-competition/indoor-location-competition-20/blob/master/data/site1/B1/floor_info.json"
-FLOOR_IMG_URL  = "https://github.com/location-competition/indoor-location-competition-20/blob/master/data/site1/B1/floor_image.png"
-GT_FOLDER_URL  = "https://github.com/location-competition/indoor-location-competition-20/tree/master/data/site1/B1/path_data_files"
+GEOJSON_URL    = "https://github.com/location-competition/indoor-location-competition-20/blob/master/data/site1/F1/geojson_map.json"
+FLOOR_INFO_URL = "https://github.com/location-competition/indoor-location-competition-20/blob/master/data/site1/F1/floor_info.json"
+FLOOR_IMG_URL  = "https://github.com/location-competition/indoor-location-competition-20/blob/master/data/site1/F1/floor_image.png"
+GT_FOLDER_URL  = "https://github.com/location-competition/indoor-location-competition-20/tree/master/data/site1/F1/path_data_files"
 
-CACHE_DIR      = os.path.join("indoor_cache", "site1", "B1")
-OUT_HTML       = "b1_magnetic_heatmap.html"
+CACHE_DIR      = os.path.join("indoor_cache", "site1", "F1")
+OUT_HTML       = "F1_magnetic_heatmap.html"
 
 STYLE_FIELD    = ""       # GeoJSON properties 里想用于着色的字段（留空则统一样式）
 NAME_FILTER    = ""       # 只处理文件名包含该子串的 .txt（留空=全部）
