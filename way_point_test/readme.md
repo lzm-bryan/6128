@@ -1,0 +1,6 @@
+test.py把B1中所有waypoint展示一下
+plot.py把geomap展示一下
+indoor.py单纯结合没有映射
+indoor_plus.py映射感觉好很多
+
+geomag_heatnmap热力图尝试1
