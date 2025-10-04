@@ -1,0 +1,8 @@
+这个文件预备一下机器学习
+先提取出来数据excel看看格式
+txt2excel_sensors看着搞一下特征值x xlsx
+prep_fingerprint_csv标签和特征值csv
+preprocess_fingerprint_dataset生成npy的训练数据测试数据包
+train_mlp训练保存预测和标签看对比
+viz_pred_vs_true看图
+train_stronger更强模型

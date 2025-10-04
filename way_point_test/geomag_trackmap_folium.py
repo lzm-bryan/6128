@@ -416,16 +416,13 @@ if __name__ == "__main__":
     main()
 
 
-# 1) 最常用：校准磁力计 + |B|，颜色分位 10–90，粗线
-python geomag_trackmap_folium.py --floor-dir .\site1\B1 \
-  --source cal --stat mag --q 10,90 --lw 5 --alpha 0.95 --out b1_track.html
+# # 1) 最常用：校准磁力计 + |B|，颜色分位 10–90，粗线
+# python geomag_trackmap_folium.py --floor-dir .\site1\B1 --source cal --stat mag --q 10,90 --lw 5 --alpha 0.95 --out b1_track.html
 
-# 2) 固定颜色范围，保证不同楼层可比（例如 20~70 μT）
-python geomag_trackmap_folium.py --floor-dir .\site1\B1 \
-  --vminmax 20,70 --lw 5 --alpha 0.95 --out b1_track_20_70.html
+# # 2) 固定颜色范围，保证不同楼层可比（例如 20~70 μT）
+# python geomag_trackmap_folium.py --floor-dir .\site1\B1 --vminmax 20,70 --lw 5 --alpha 0.95 --out b1_track_20_70.html
+#
+# # 3) 未校准并去偏（TXT 含 bias 三元组时）
+# python geomag_trackmap_folium.py --floor-dir .\site1\F1 --source uncal_debiased --q 15,85 --lw 5 --alpha 0.95 --out f1_track.html
 
-# 3) 未校准并去偏（TXT 含 bias 三元组时）
-python geomag_trackmap_folium.py --floor-dir .\site1\F1 \
-  --source uncal_debiased --q 15,85 --lw 5 --alpha 0.95 --out f1_track.html
 
-还没测试

@@ -5,3 +5,4 @@ indoor_plus.py映射感觉好很多
 
 geomag_heatnmap热力图尝试1
 geomag_trackmap参照论文格式只生成图片
+geomag_trackmap_folium网站
